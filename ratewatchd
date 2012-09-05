@@ -1,0 +1,183 @@
+#!/usr/bin/perl -w
+use strict;
+use diagnostics;
+use Fcntl qw(:flock);
+use POSIX qw(setsid);
+use File::Tail;
+use Sys::Syslog;
+use JSON;
+
+# ratewatchd: An experimental per-sender rate monitor for Postfix
+#
+# Copyright (c) 2012, Martin Schmitt <mas at scsy dot de>
+#
+# Permission to use, copy, modify, and/or distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+my $interval       = 300;
+my $limit          = 2;
+my $alerted        = 0; # Init with zero
+my $alert_interval = 60;
+my $postfix_name   = 'postfix-vmx1'; # Use 'postfix' for a Postfix with only one instance
+my $logfile        = '/var/log/mail.info';
+my $lockfile       = '/var/lock/ratewatchd';
+my $dumpfile       = '/var/run/ratewatchd.state';
+
+# Debugging features:
+# Set environment NOFORK=1 to run in foreground 
+# Set environment DEBUG=1 to enable submission of debug messages to Syslog
+# e.g. like this: NOFORK=1 DEBUG=1 ./ratewatchd
+my ($dontfork, $log_debug);
+$dontfork  = 1 if ($ENV{'NOFORK'});
+$log_debug = 1 if ($ENV{'DEBUG'});
+
+# Data is held in-memory by this hash:
+my %data;
+
+# Begin logging to Syslog
+openlog('ratewatchd', 'ndelay,pid', 'mail');
+dolog('info', "ratewatch is starting up.");
+
+# See if a dumpfile to restore is available.
+my $json=JSON->new()->pretty(1);
+restoredata() if (-e $dumpfile);
+
+# Open Pidfile, write PID and lock it. 
+open my $lock_fh, ">$lockfile" or do { dolog ('warning', "Could not create $lockfile: $!"); exit 1; };
+if (flock($lock_fh,LOCK_EX|LOCK_NB)){
+        dolog('debug', "Lockfile created: $lockfile");
+}else{
+        close $lock_fh;
+        dolog('warning', "Another instance of ratewatchd seems to be running! Aborted.");
+        exit 1;
+}
+print $lock_fh "$$\n";
+
+# Flush the lockfile's filehandle, perlfaq5:
+select((select($lock_fh), $| = 1)[0]);
+dolog('debug', "PID is: $$");
+
+# Fork unless told otherwise
+unless ($dontfork){
+        fork && exit;
+        # Update lockfile with PID of forked process
+        seek ($lock_fh, 0, 0);
+        print $lock_fh "$$\n";
+        select((select($lock_fh), $| = 1)[0]);  # perlfaq5
+        dolog('debug', "Forked. Daemon PID is: $$");
+        chdir ('/');
+        open STDIN,  "/dev/null"  or die "STDIN </dev/null: $!\n";
+        open STDOUT, ">/dev/null" or die "STDOUT >/dev/null: $!\n";
+        open STDERR, ">/dev/null" or die "STDERR >/dev/null: $!\n";
+        setsid();
+}
+
+# Start tailing the logfile
+my $tail = File::Tail->new(name => $logfile, maxinterval => 1, nowait => 1);
+
+dolog('info', "Running.");
+
+my $killed = 0;
+$SIG{TERM} = sub { $killed = 1; };
+$SIG{INT}  = sub { $killed = 1; };
+$SIG{HUP}  = \&dumpdata;
+
+# Le main loop.
+while(defined(my $line = $tail->read)) {
+	chomp $line;
+	if ($line =~ /$postfix_name\/qmgr\[.+from=\<(.+)\>, size.+, nrcpt=(\d+)/){
+		tally($1, $2);
+		dolog('debug', $line);
+	}
+	last if ($killed);
+}
+
+dumpdata();
+dolog('info', "ratewatch is exiting.");
+close $lock_fh;
+unlink $lockfile;
+
+sub tally{
+	# Keep track of sent mail per sender
+	my ($from, $recipients) = @_;
+	my $now = time();
+	for (1..$recipients){
+		push @{$data{$now}}, $from;
+	}
+
+	my %from_count;
+	foreach my $timestamp (keys(%data)){
+		if ($now - $timestamp > $interval){
+			delete $data{$timestamp};
+		}else{
+			foreach my $from_sender (@{$data{$timestamp}}){
+				$from_count{$from_sender}++;
+			}
+		}
+	}
+
+	# Generate alerts only every $alert_interval seconds:
+	#return if ($now - $alerted < $alert_interval);
+	foreach(keys(%from_count)){
+		print "$_: $from_count{$_}\n";
+		if ($from_count{$_} > $limit){
+			dolog('warning', "WARNING: $_: Sent mail to $from_count{$_} recipients in ${interval}s (limit is: $limit)");
+			print "WARNING: $_: Sent mail to $from_count{$_} recipients in ${interval}s (limit is: $limit)\n";
+		}
+	}
+	$alerted = $now;
+}
+
+sub dolog{
+        my $severity = shift; # ('debug'|'info'|'warning')
+        my $message  = shift;
+        # Exit immediately if $log_debug is not set, to save CPU.
+        if ($severity eq "debug"){
+                return undef unless ($log_debug);
+        }
+        chomp $message;
+        printf STDERR ("%8s: %s\n", $severity, $message);
+        $message =~ s/\%/\%\%/g;
+
+        syslog($severity, $message);
+}
+
+sub dumpdata{
+	dolog('info', "Dump of raw in-memory data requested.");
+	open my $fh_out, ">$dumpfile";
+	unless ($fh_out){
+		dolog('warning', "Couldn't open $dumpfile for writing: $!");
+		return 0;
+	}
+	my $out = $json->encode(\%data);
+	my $length = length($out);
+	print $fh_out $out;
+	close $fh_out;
+	dolog('info', "Dumped $length bytes to $dumpfile.");
+}
+
+sub restoredata{
+	dolog('info', "Trying to restore data from $dumpfile.");
+	open my $fh_in, "<$dumpfile";
+	unless ($fh_in){
+		dolog('warning', "Couldn't open $dumpfile for reading: $!");
+		return 0;
+	}
+	my $in;
+	while (<$fh_in>){
+		$in .= $_;
+	}
+	close $fh_in;
+	my $length = length($in);
+	%data = %{$json->decode($in)};
+	dolog('info', "Restored $length bytes from $dumpfile.");
+}
