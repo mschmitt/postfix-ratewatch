@@ -82,7 +82,7 @@ unless ($dontfork){
 }
 
 # Start tailing the logfile
-my $tail = File::Tail->new(name => $logfile, maxinterval => 1, nowait => 1);
+my $tail = File::Tail->new(name => $logfile, maxinterval => 1);
 
 dolog('info', "Running.");
 
