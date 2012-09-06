@@ -24,7 +24,7 @@ use JSON;
 # OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 my $interval       = 300;
-my $limit          = 2;
+my $limit          = 10;
 my $alerted        = 0; # Init with zero
 my $alert_interval = 60;
 my $postfix_name   = 'postfix-vmx1'; # Use 'postfix' for a Postfix with only one instance
@@ -126,7 +126,7 @@ sub tally{
 	}
 
 	# Generate alerts only every $alert_interval seconds:
-	#return if ($now - $alerted < $alert_interval);
+	return if ($now - $alerted < $alert_interval);
 	foreach(keys(%from_count)){
 		print "$_: $from_count{$_}\n";
 		if ($from_count{$_} > $limit){
